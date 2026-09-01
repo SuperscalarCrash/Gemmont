@@ -1,0 +1,21 @@
+/out/
+/target/
+/build/
+/dist/
+/compile-resources/
+/core_top.v
+
+# Local worktrees and generated metadata
+/.worktrees/
+/.DS_Store
+.DS_Store
+**/.DS_Store
+
+.metals/
+.vscode/
+.bsp/
+.manual_build/
+__pycache__/
+*.pyc
+
+/*.pdf

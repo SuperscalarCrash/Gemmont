@@ -1,0 +1,7 @@
+self-hosted-runner:
+  labels:
+    - verilator
+    - vivado-2023.2
+    - builder
+
+config-variables: null

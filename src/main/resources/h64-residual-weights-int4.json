@@ -1,0 +1,31 @@
+{
+  "format": "gemmont-residual-int4-super-row-v1",
+  "rom": {
+    "logical_entries": 1024,
+    "logical_banks": 4,
+    "physical_banks": 8,
+    "rows_per_bank": 256,
+    "weights_per_entry": 66,
+    "entry_bits": 264,
+    "physical_bank_bits": 132,
+    "physical_row_bits": 1056
+  },
+  "model": {
+    "fetch_width": 4,
+    "history_bits": 64,
+    "path_bits": 32,
+    "index_mode": "gshare_path",
+    "pc_entries": 1024,
+    "pc_hash": "xor",
+    "use_bias_feature": false,
+    "use_pht_strength": false,
+    "decision": "flip fast iff signed accumulator > 0; zero abstains"
+  },
+  "quantization": {
+    "weight_bits": 4,
+    "weight_min": -7,
+    "weight_max": 7,
+    "scheme": "checkpoint-fixed row scales, round-to-nearest, clamp [-7, 7]"
+  },
+  "rom_sha256": "168a122831b4c5aabb790b1c926486146553365d2ca8362af6683bc68d09fe05"
+}

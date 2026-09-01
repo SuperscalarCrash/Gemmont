@@ -1,0 +1,33 @@
+//| mill-version: 1.1.6
+//| mill-jvm-version: temurin:17
+
+package build
+
+import mill._, scalalib._
+import mill.api.BuildCtx
+
+object core extends ScalaModule {
+  def scalaVersion = "2.12.18"
+
+  def sources = Task.Sources(BuildCtx.workspaceRoot / "src" / "main" / "scala")
+
+  def resources =
+    Task.Sources(BuildCtx.workspaceRoot / "src" / "main" / "resources")
+
+  def scalacOptions = Seq(
+    "-deprecation",
+    "-feature",
+    "-unchecked",
+    "-language:reflectiveCalls",
+    "-Ywarn-unused:imports,locals,privates,params,patvars",
+    "-Xfatal-warnings"
+  )
+
+  def mvnDeps = Seq(
+    mvn"edu.berkeley.cs::chisel3:3.6.1"
+  )
+
+  def scalacPluginMvnDeps = Seq(
+    mvn"edu.berkeley.cs:::chisel3-plugin:3.6.1"
+  )
+}

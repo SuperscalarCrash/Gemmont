@@ -1,0 +1,419 @@
+name: Frozen release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gemmont-release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    name: Validate release pins
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      chiplab_url: ${{ steps.config.outputs.chiplab_url }}
+      functional_ref: ${{ steps.config.outputs.functional_ref }}
+      functional_sha: ${{ steps.config.outputs.functional_sha }}
+      fpga_ref: ${{ steps.config.outputs.fpga_ref }}
+      fpga_sha: ${{ steps.config.outputs.fpga_sha }}
+      uboot_ref: ${{ steps.config.outputs.uboot_ref }}
+      uboot_sha: ${{ steps.config.outputs.uboot_sha }}
+      func_mhz: ${{ steps.config.outputs.func_mhz }}
+      perf_mhz: ${{ steps.config.outputs.perf_mhz }}
+      uboot_mhz: ${{ steps.config.outputs.uboot_mhz }}
+      mill_version: ${{ steps.config.outputs.mill_version }}
+      mill_launcher_sha256: ${{ steps.config.outputs.mill_launcher_sha256 }}
+    steps:
+      - name: Check out Gemmont tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Validate the single release configuration
+        id: config
+        shell: bash
+        run: python3 scripts/ci/read-release-config.py --github-output "${GITHUB_OUTPUT}"
+
+      - name: Verify pinned Chiplab commits
+        shell: bash
+        env:
+          CHIPLAB_URL: ${{ steps.config.outputs.chiplab_url }}
+          FUNCTION_REF: ${{ steps.config.outputs.functional_ref }}
+          FUNCTION_SHA: ${{ steps.config.outputs.functional_sha }}
+          FPGA_REF: ${{ steps.config.outputs.fpga_ref }}
+          FPGA_SHA: ${{ steps.config.outputs.fpga_sha }}
+          UBOOT_REF: ${{ steps.config.outputs.uboot_ref }}
+          UBOOT_SHA: ${{ steps.config.outputs.uboot_sha }}
+        run: |
+          set -euo pipefail
+          mirror_dir="$(mktemp -d)"
+          trap 'rm -rf "${mirror_dir}"' EXIT
+          git -C "${mirror_dir}" init -q
+          git -C "${mirror_dir}" remote add origin "${CHIPLAB_URL}"
+
+          verify_pin() {
+            local role="$1"
+            local ref="$2"
+            local sha="$3"
+            # Keep the complete commit graph without downloading repository
+            # blobs.  A depth-one fetch cannot validate a historical pin.
+            git -C "${mirror_dir}" fetch -q --no-tags --filter=blob:none origin \
+              "refs/heads/${ref}:refs/remotes/origin/${ref}"
+            git -C "${mirror_dir}" cat-file -e "${sha}^{commit}"
+            git -C "${mirror_dir}" merge-base --is-ancestor \
+              "${sha}" "refs/remotes/origin/${ref}"
+            echo "${role}: ${ref} contains ${sha}"
+          }
+
+          verify_pin functional "${FUNCTION_REF}" "${FUNCTION_SHA}"
+          verify_pin fpga "${FPGA_REF}" "${FPGA_SHA}"
+          verify_pin uboot "${UBOOT_REF}" "${UBOOT_SHA}"
+
+  generate:
+    name: Compile, format, and generate RTL
+    needs: prepare
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out Gemmont tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v5
+        with:
+          distribution: temurin
+          java-version: "17"
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Compile and check Scala format
+        shell: bash
+        env:
+          MILL_VERSION: ${{ needs.prepare.outputs.mill_version }}
+          MILL_LAUNCHER_SHA256: ${{ needs.prepare.outputs.mill_launcher_sha256 }}
+        run: |
+          set -euo pipefail
+          mill_bin="${RUNNER_TEMP}/gemmont-mill"
+          curl --fail --location --silent --show-error \
+            "https://repo1.maven.org/maven2/com/lihaoyi/mill-dist/${MILL_VERSION}/mill-dist-${MILL_VERSION}-mill.sh" \
+            --output "${mill_bin}"
+          printf '%s  %s\n' "${MILL_LAUNCHER_SHA256}" "${mill_bin}" \
+            | sha256sum --check --strict
+          chmod +x "${mill_bin}"
+          ln -sf "${mill_bin}" "${RUNNER_TEMP}/mill"
+          printf '%s\n' "${RUNNER_TEMP}" >>"${GITHUB_PATH}"
+          export PATH="${RUNNER_TEMP}:${PATH}"
+          mill --version
+          mill core.compile
+          mill mill.scalalib.scalafmt/checkFormatAll
+
+      - name: Generate and validate shared RTL
+        shell: bash
+        run: |
+          set -euo pipefail
+          ./scripts/generate.sh
+          test -s core_top.v
+          test -s difftest_wrap.v
+          [[ "$(grep -c '^module core_top' core_top.v)" == 1 ]]
+          grep -q 'PerformanceCounterSink' core_top.v
+          sha256sum core_top.v difftest_wrap.v
+
+      - name: Upload shared generated RTL
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-rtl
+          path: |
+            core_top.v
+            difftest_wrap.v
+          if-no-files-found: error
+          retention-days: 3
+
+  simulation:
+    name: Functional Verilator simulation
+    needs: [prepare, generate]
+    runs-on: [self-hosted, linux, x64, verilator]
+    timeout-minutes: 600
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      RELEASE_CONFIG: ${{ github.workspace }}/ci/release-config.json
+      VERILATOR_THREADS: "8"
+      VERILATOR_IMAGE: ${{ vars.VERILATOR_IMAGE }}
+    steps:
+      - name: Check out Gemmont tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download shared generated RTL
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-rtl
+          path: build/generated-rtl
+
+      - name: Run functional validation
+        shell: bash
+        env:
+          CORE_RTL_DIR: ${{ github.workspace }}/build/generated-rtl
+        run: ./scripts/ci/run-verilator-container.sh
+
+      - name: Publish functional report
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          if [[ -f build/verilator-validation/reports/functional-summary.md ]]; then
+            cat build/verilator-validation/reports/functional-summary.md >>"${GITHUB_STEP_SUMMARY}"
+          fi
+
+      - name: Upload functional report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-functional-verification
+          path: build/verilator-validation/reports/
+          if-no-files-found: warn
+
+  fpga:
+    name: Build FPGA ${{ matrix.target }}
+    needs: [prepare, generate]
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        target: [func, perf, uboot]
+    runs-on: [self-hosted, linux, x64, vivado-2023.2, builder]
+    timeout-minutes: 720
+    env:
+      SOURCE_SHA: ${{ github.sha }}
+      RELEASE_VERSION: ${{ github.ref_name }}
+      RELEASE_CONFIG: ${{ github.workspace }}/ci/release-config.json
+      FPGA_BUILD_TARGET: ${{ matrix.target }}
+      VIVADO_IMAGE: ${{ vars.VIVADO_IMAGE }}
+      VIVADO_JOBS: "8"
+      VIVADO_RUN_TIMEOUT_MINUTES: "240"
+    steps:
+      - name: Check out Gemmont tag
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download shared generated RTL
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-rtl
+          path: build/generated-rtl
+
+      - name: Install and verify shared RTL
+        shell: bash
+        run: |
+          set -euo pipefail
+          install -m 0644 build/generated-rtl/core_top.v core_top.v
+          install -m 0644 build/generated-rtl/difftest_wrap.v difftest_wrap.v
+          [[ "$(grep -c '^module core_top' core_top.v)" == 1 ]]
+          grep -q 'PerformanceCounterSink' core_top.v
+          sha256sum core_top.v difftest_wrap.v
+
+      - name: Build bitstream
+        shell: bash
+        run: ./scripts/ci/run-vivado-build.sh
+
+      - name: Add timing report to job summary
+        if: always()
+        shell: bash
+        run: |
+          set -euo pipefail
+          summary="build/fpga-release/stage/${FPGA_BUILD_TARGET}/reports/${FPGA_BUILD_TARGET}/timing-summary.md"
+          [[ -f "${summary}" ]] && cat "${summary}" >>"${GITHUB_STEP_SUMMARY}" || true
+
+      - name: Upload FPGA target
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-fpga-${{ matrix.target }}
+          path: build/fpga-release/stage/${{ matrix.target }}/
+          if-no-files-found: error
+          compression-level: 0
+
+      - name: Upload FPGA diagnostics
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-fpga-${{ matrix.target }}-diagnostics
+          path: |
+            build/fpga-release/logs/**
+            build/fpga-release/work/${{ matrix.target }}/**/*.bit
+            build/fpga-release/work/${{ matrix.target }}/**/*.jou
+            build/fpga-release/work/${{ matrix.target }}/**/*.log
+            build/fpga-release/work/${{ matrix.target }}/**/*.ltx
+            build/fpga-release/work/${{ matrix.target }}/**/*.rpt
+          if-no-files-found: warn
+          retention-days: 14
+
+  package:
+    name: Package FPGA release
+    needs: [prepare, fpga]
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      RELEASE_VERSION: ${{ github.ref_name }}
+      SOURCE_SHA: ${{ github.sha }}
+      RELEASE_CONFIG: ${{ github.workspace }}/ci/release-config.json
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download FPGA targets
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-fpga-func
+          path: build/fpga-parts/func
+
+      - name: Download perf FPGA target
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-fpga-perf
+          path: build/fpga-parts/perf
+
+      - name: Download U-Boot FPGA target
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-fpga-uboot
+          path: build/fpga-parts/uboot
+
+      - name: Assemble and checksum release bundle
+        shell: bash
+        run: ./scripts/ci/assemble-fpga-release.sh
+
+      - name: Add aggregate timing report
+        shell: bash
+        run: |
+          set -euo pipefail
+          bundle="dist/Gemmont-${GITHUB_REF_NAME}-nscscc"
+          for target in func perf uboot; do
+            cat "${bundle}/reports/${target}/timing-summary.md" >>"${GITHUB_STEP_SUMMARY}"
+            echo >>"${GITHUB_STEP_SUMMARY}"
+          done
+
+      - name: Upload release bundle
+        uses: actions/upload-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-bundle
+          path: |
+            dist/*.zip
+            dist/*.sha256
+          if-no-files-found: error
+          compression-level: 0
+
+  publish:
+    name: Publish release
+    needs: [simulation, package]
+    if: >-
+      needs.simulation.result == 'success' &&
+      needs.package.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write
+    steps:
+      - name: Check out release tooling
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Download release bundle
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-bundle
+          path: release
+
+      - name: Download functional report
+        uses: actions/download-artifact@v4
+        with:
+          name: Gemmont-${{ github.ref_name }}-functional-verification
+          path: verification
+
+      - name: Verify bundle checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd release
+          sha256sum -c Gemmont-*-nscscc.zip.sha256
+
+      - name: Render release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          archives=(release/Gemmont-*-nscscc.zip)
+          ((${#archives[@]} == 1))
+          mkdir -p release/extracted
+          unzip -q "${archives[0]}" -d release/extracted
+          bundles=(release/extracted/Gemmont-*-nscscc)
+          ((${#bundles[@]} == 1))
+          bundle="${bundles[0]}"
+          python3 scripts/ci/render-release-notes.py \
+            --build-info "${bundle}/BUILD_INFO.txt" \
+            --func-timing "${bundle}/reports/func/timing-metrics.json" \
+            --perf-timing "${bundle}/reports/perf/timing-metrics.json" \
+            --uboot-timing "${bundle}/reports/uboot/timing-metrics.json" \
+            --functional-results verification/functional-results.json \
+            --repository "${GITHUB_REPOSITORY}" \
+            --output release/release-notes.md
+          cat release/release-notes.md >>"${GITHUB_STEP_SUMMARY}"
+
+      - name: Attach bundle and reports to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Gemmont ${{ github.ref_name }}
+          body_path: release/release-notes.md
+          generate_release_notes: true
+          files: |
+            release/*.zip
+            release/*.sha256
+            verification/functional-summary.md
+            verification/functional-results.json

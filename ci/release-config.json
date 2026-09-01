@@ -1,0 +1,28 @@
+{
+  "chiplab": {
+    "url": "https://github.com/SuperscalarCrash/chiplab",
+    "pins": {
+      "functional": {
+        "ref": "chiplab_diff",
+        "sha": "614c047a1961ad505cb86755115d1dc28229b22a"
+      },
+      "fpga": {
+        "ref": "nscscc2026",
+        "sha": "c398d274812f164d387146fa7d8f612a4a1296d9"
+      },
+      "uboot": {
+        "ref": "system",
+        "sha": "f8fbd2e06a7b33881582086ff4c2c4003c3064aa"
+      }
+    }
+  },
+  "frequencies_mhz": {
+    "func": 33,
+    "perf": 109.091,
+    "uboot": 100
+  },
+  "mill": {
+    "version": "1.1.6",
+    "launcher_sha256": "af73fadc1fa005e43962bcd529690f448592f4e0786a90b712ac6509378a9eb2"
+  }
+}
